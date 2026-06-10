@@ -184,6 +184,63 @@ constexpr int kDSTRoundingOffsetHours = 4;
 // usually happens when history sync was turned off.
 constexpr int kSyncHistoryForeignVisitsToDeletePerBatch = 100;
 
+// Resolves the first visit in `visit`'s redirect chain while caching every
+// visit examined on the way. A batch of annotated visits can contain many
+// visits from the same redirect chain, so caching avoids repeatedly walking the
+// same chain prefix from each visit.
+VisitRow GetRedirectChainStartWithCache(
+    HistoryDatabase* db,
+    const VisitRow& visit,
+    std::map<VisitID, VisitRow>& redirect_chain_start_cache) {
+  if (!db)
+    return {};
+
+  auto cached_start = redirect_chain_start_cache.find(visit.visit_id);
+  if (cached_start != redirect_chain_start_cache.end())
+    return cached_start->second;
+
+  VisitRow current_visit = visit;
+  VisitRow redirect_start;
+  std::vector<VisitID> chain_visit_ids;
+  base::flat_set<VisitID> seen_visits;
+
+  while (true) {
+    if (!seen_visits.insert(current_visit.visit_id).second) {
+      DLOG(WARNING) << "Loop in visit redirect chain, possible db corruption";
+      redirect_start = {};
+      break;
+    }
+
+    chain_visit_ids.push_back(current_visit.visit_id);
+
+    auto cached_current =
+        redirect_chain_start_cache.find(current_visit.visit_id);
+    if (cached_current != redirect_chain_start_cache.end()) {
+      redirect_start = cached_current->second;
+      break;
+    }
+
+    if ((current_visit.transition & ui::PAGE_TRANSITION_CHAIN_START) ||
+        !current_visit.referring_visit) {
+      redirect_start = current_visit;
+      break;
+    }
+
+    VisitRow referring_visit;
+    if (!db->GetRowForVisit(current_visit.referring_visit, &referring_visit)) {
+      redirect_start = {};
+      break;
+    }
+
+    current_visit = referring_visit;
+  }
+
+  for (VisitID visit_id : chain_visit_ids)
+    redirect_chain_start_cache[visit_id] = redirect_start;
+
+  return redirect_start;
+}
+
 // Merges `update` into `existing` by overwriting fields in `existing` that are
 // not the default value in `update`.
 void MergeUpdateIntoExistingModelAnnotations(
@@ -2379,6 +2436,7 @@ std::vector<AnnotatedVisit> HistoryBackend::ToAnnotatedVisitsFromRows(
   VisitSourceMap sources;
   GetVisitsSource(visit_rows, &sources);
 
+  std::map<VisitID, VisitRow> redirect_chain_start_cache;
   std::vector<AnnotatedVisit> annotated_visits;
   for (const auto& visit_row : visit_rows) {
     // Add a result row for this visit, get the URL info from the DB.
@@ -2404,7 +2462,8 @@ std::vector<AnnotatedVisit> HistoryBackend::ToAnnotatedVisitsFromRows(
     VisitID referring_visit_of_redirect_chain_start = 0;
     VisitID opener_visit_of_redirect_chain_start = 0;
     if (compute_redirect_chain_start_properties) {
-      VisitRow redirect_start = GetRedirectChainStart(visit_row);
+      VisitRow redirect_start = GetRedirectChainStartWithCache(
+          db_.get(), visit_row, redirect_chain_start_cache);
       referring_visit_of_redirect_chain_start = redirect_start.referring_visit;
       opener_visit_of_redirect_chain_start = redirect_start.opener_visit;
     }
@@ -2682,7 +2741,8 @@ VisitVector HistoryBackend::GetRedirectChain(VisitRow visit) {
   result.push_back(visit);
   if (db_) {
     base::flat_set<VisitID> visit_set;
-    while (!(visit.transition & ui::PAGE_TRANSITION_CHAIN_START)) {
+    while (visit.referring_visit &&
+           !(visit.transition & ui::PAGE_TRANSITION_CHAIN_START)) {
       visit_set.insert(visit.visit_id);
       // `GetRowForVisit()` should not return false if the DB is correct.
       VisitRow referring_visit;

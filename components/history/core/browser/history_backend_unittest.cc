@@ -26,6 +26,7 @@
 #include "base/memory/ref_counted.h"
 #include "base/run_loop.h"
 #include "base/strings/string_number_conversions.h"
+#include "base/strings/stringprintf.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/task/single_thread_task_runner.h"
 #include "base/test/gtest_util.h"
@@ -5195,6 +5196,69 @@ TEST_F(HistoryBackendTest, GetRedirectChainStart) {
   }
 }
 
+TEST_F(HistoryBackendTest, GetAnnotatedVisitsWithLongRedirectChain) {
+  constexpr int kChainLength = 200;
+
+  base::Time last_visit_time = base::Time::Now();
+  const auto add_visit = [&](const std::string& url_string,
+                             VisitID referring_visit, VisitID opener_visit,
+                             ui::PageTransition transition) {
+    last_visit_time += base::Milliseconds(1);
+    auto ids = backend_->AddPageVisit(
+        GURL(url_string), last_visit_time, referring_visit,
+        /*external_referrer_url=*/GURL(), transition, /*hidden=*/false,
+        SOURCE_BROWSED, VisitResponseCodeCategory::kNot404,
+        /*should_increment_typed_count=*/false, opener_visit,
+        /*consider_for_ntp_most_visited=*/true);
+    backend_->AddContextAnnotationsForVisit(ids.second,
+                                            VisitContextAnnotations());
+    return ids.second;
+  };
+
+  const VisitID referring_visit = add_visit(
+      "https://referrer.example/", /*referring_visit=*/0, /*opener_visit=*/0,
+      ui::PageTransitionFromInt(ui::PAGE_TRANSITION_TYPED |
+                                ui::PAGE_TRANSITION_CHAIN_START |
+                                ui::PAGE_TRANSITION_CHAIN_END));
+
+  std::vector<VisitID> chain_visit_ids;
+  chain_visit_ids.reserve(kChainLength);
+  VisitID previous_visit = referring_visit;
+  for (int i = 0; i < kChainLength; ++i) {
+    int transition = ui::PAGE_TRANSITION_TYPED | ui::PAGE_TRANSITION_CHAIN_END;
+    if (i == 0) {
+      transition |= ui::PAGE_TRANSITION_CHAIN_START;
+    } else {
+      transition |= ui::PAGE_TRANSITION_SERVER_REDIRECT;
+    }
+    previous_visit = add_visit(
+        base::StringPrintf("https://redirect-%d.example/", i),
+        previous_visit, referring_visit,
+        ui::PageTransitionFromInt(transition));
+    chain_visit_ids.push_back(previous_visit);
+  }
+
+  QueryOptions query_options;
+  query_options.duplicate_policy = QueryOptions::KEEP_ALL_DUPLICATES;
+  query_options.visit_order = QueryOptions::OLDEST_FIRST;
+  auto annotated_visits = backend_->GetAnnotatedVisits(
+      query_options, /*compute_redirect_chain_start_properties=*/true,
+      /*get_unclustered_visits_only=*/false);
+  ASSERT_EQ(annotated_visits.size(), chain_visit_ids.size() + 1);
+
+  for (size_t i = 0; i < chain_visit_ids.size(); ++i) {
+    const auto& annotated_visit = annotated_visits[i + 1];
+    EXPECT_EQ(annotated_visit.visit_row.visit_id, chain_visit_ids[i])
+        << "chain index: " << i;
+    EXPECT_EQ(annotated_visit.referring_visit_of_redirect_chain_start,
+              referring_visit)
+        << "chain index: " << i;
+    EXPECT_EQ(annotated_visit.opener_visit_of_redirect_chain_start,
+              referring_visit)
+        << "chain index: " << i;
+  }
+}
+
 TEST_F(HistoryBackendTest, GetRedirectChain) {
   const auto add_visit_chain = [&](std::vector<std::string> urls,
                                    base::Time visit_time,
@@ -5265,6 +5329,21 @@ TEST_F(HistoryBackendTest, GetRedirectChain) {
   EXPECT_EQ(chain3[0].visit_id, chain3_ids[0]);
   EXPECT_EQ(chain3[1].visit_id, chain3_ids[1]);
   EXPECT_EQ(chain3[2].visit_id, chain3_ids[2]);
+
+  auto orphaned_ids = backend_->AddPageVisit(
+      GURL("https://orphaned-redirect.example/"), time3 + base::Minutes(1),
+      /*referring_visit=*/0, /*external_referrer_url=*/GURL(),
+      ui::PageTransitionFromInt(ui::PAGE_TRANSITION_TYPED |
+                                ui::PAGE_TRANSITION_CHAIN_END),
+      /*hidden=*/false, SOURCE_BROWSED, VisitResponseCodeCategory::kNot404,
+      /*should_increment_typed_count=*/false, /*opener_visit=*/0,
+      /*consider_for_ntp_most_visited=*/true);
+  VisitID orphaned_visit_id = orphaned_ids.second;
+  VisitRow orphaned_visit;
+  backend_->db_->GetRowForVisit(orphaned_visit_id, &orphaned_visit);
+  VisitVector orphaned_chain = backend_->GetRedirectChain(orphaned_visit);
+  ASSERT_EQ(orphaned_chain.size(), 1u);
+  EXPECT_EQ(orphaned_chain[0].visit_id, orphaned_visit_id);
 }
 
 TEST_F(HistoryBackendTest, AddSyncedVisitAddsOnlyValidURLs) {
